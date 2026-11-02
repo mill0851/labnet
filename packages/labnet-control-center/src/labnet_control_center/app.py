@@ -19,13 +19,13 @@ from collections.abc import Callable, Sequence
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool, StrictInt
 from starlette.datastructures import Headers
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -49,10 +49,11 @@ from .experiment_api import create_experiment_router
 from .experiment_schema import EXPERIMENT_ID
 from .experiment_store import ExperimentError, ExperimentStore
 from .ingress import HumanIngress
+from .panels import driver_panel, panel_for
 from labnet.redaction import redact
 from .request_checks import request_user
 from .scripting import MAX_SCRIPT_CHARACTERS
-from .sessions import SessionError, SessionManager
+from .sessions import MAX_CALL_SECONDS, SessionError, SessionManager
 
 
 LOGGER = logging.getLogger(__name__)
@@ -176,9 +177,11 @@ def _device(device: DeviceInfo, *, lab_pc_online: bool) -> dict[str, Any]:
         detail = device.status_text or f"{device.runtime_state}, {device.availability}"
     methods = describe_device_type(device.device_type)
     contract = registry.find(device.device_type)
+    panel, panel_url = panel_for(device.device_type)
     return {
-        # Which control panel the device page loads (static/js/panels/<panel>.js).
-        "panel": _panel_for(device.device_type),
+        # Which control panel the device page loads (see panels.py), and from where.
+        "panel": panel,
+        "panel_url": panel_url,
         "id": device.device_id,
         "type": device.device_type,
         "type_label": type_label(device.device_type),
@@ -226,10 +229,6 @@ def _with_activity(snapshot: dict[str, Any], held: dict[str, dict[str, Any]]) ->
         "leased": sum(item["state"] == "leased" for item in devices),
     }
     return {**snapshot, "summary": summary, "lab_pcs": pcs}
-
-
-def _panel_for(device_type: str) -> str:
-    return device_type if (STATIC / "js" / "panels" / f"{device_type}.js").is_file() else "generic"
 
 
 # Base64 makes a file a third larger.
@@ -351,6 +350,19 @@ class PlayRequest(BaseModel):
 
 class ScriptRequest(BaseModel):
     code: str = Field(min_length=1, max_length=MAX_SCRIPT_CHARACTERS)
+
+
+CallArgument = StrictBool | StrictInt | Annotated[float, Field(strict=True, allow_inf_nan=False)] | Annotated[
+    str, Field(max_length=1024)
+]
+
+
+class CallRequest(BaseModel):
+    """One method for a control panel: its arguments by name, and how long it may take."""
+
+    method: str = Field(min_length=1, max_length=128)
+    args: dict[str, CallArgument] = Field(default_factory=dict, max_length=32)
+    timeout_seconds: float = Field(default=30.0, gt=0, le=MAX_CALL_SECONDS)
 
 
 def _sse(event: dict[str, Any]) -> str:
@@ -696,6 +708,29 @@ def create_app(
         state = await session_for(device_id).release("Paused from the device list.")
         app.state.status.invalidate()
         return state
+
+    @app.post("/api/devices/{device_id}/call")
+    async def device_call(device_id: str, body: CallRequest) -> dict[str, Any]:
+        """One method for the page's panel (a move, a setting, one spectrum): ``{"value": result}``.
+
+        It shares the page's lease, which it takes if needed; Pause releases it.
+        The Lab PC checks the arguments against the driver's and the site's limits.
+        """
+
+        try:
+            value = await session_for(device_id).call(body.method, body.args, body.timeout_seconds)
+        finally:
+            app.state.status.invalidate()
+        return {"value": value}
+
+    @app.get("/api/panels/{device_type}.js", include_in_schema=False)
+    async def panel_script(device_type: str) -> Response:
+        """The control panel a driver package ships for its device type (see panels.py)."""
+
+        source = driver_panel(device_type) if LABNET_IDENTIFIER_REGEX.fullmatch(device_type) else None
+        if source is None:
+            raise HTTPException(status_code=404, detail="Not found.")
+        return Response(source, media_type="text/javascript", headers={"Cache-Control": "no-cache"})
 
     @app.post("/api/devices/{device_id}/script")
     async def device_script(device_id: str, body: ScriptRequest) -> dict[str, Any]:

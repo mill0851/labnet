@@ -2,7 +2,7 @@
 //
 //   const chart = LabNet.createChart(canvas, { unit: "nm" });
 //   chart.setWindow(30);          // seconds shown; null shows everything
-//   chart.addPoints([[t, v], ...]) // t in Unix seconds
+//   chart.addPoints([[t, v], ...]) // t in Unix seconds; v null for a bad reading (a gap)
 //   chart.clear(); chart.points();
 
 (function () {
@@ -93,10 +93,15 @@
       let low = Infinity;
       let high = -Infinity;
       for (let index = start; index < values.length; index += 1) {
+        if (values[index] === null) continue;
         low = Math.min(low, values[index]);
         high = Math.max(high, values[index]);
       }
-      if (low === high) {
+      if (low > high) {
+        // Only bad readings in view: an empty scale.
+        low = 0;
+        high = 1;
+      } else if (low === high) {
         const spread = Math.abs(low) * 1e-7 || 1;
         low -= spread;
         high += spread;
@@ -170,6 +175,13 @@
         if (yMax !== yMin) context.lineTo(column, yMax);
       };
       for (let index = start; index < times.length; index += 1) {
+        if (values[index] === null) {
+          // A bad reading: end the line here and start again after it.
+          flush();
+          column = null;
+          started = false;
+          continue;
+        }
         const x = Math.round(xOf(times[index]));
         if (x !== column) {
           flush();
@@ -182,12 +194,14 @@
       }
       flush();
       context.stroke();
-      const lastX = xOf(times[times.length - 1]);
-      const lastY = yOf(values[values.length - 1]);
-      context.fillStyle = COLORS.line;
-      context.beginPath();
-      context.arc(lastX, lastY, 3, 0, Math.PI * 2);
-      context.fill();
+      if (values[values.length - 1] !== null) {
+        const lastX = xOf(times[times.length - 1]);
+        const lastY = yOf(values[values.length - 1]);
+        context.fillStyle = COLORS.line;
+        context.beginPath();
+        context.arc(lastX, lastY, 3, 0, Math.PI * 2);
+        context.fill();
+      }
       context.restore();
 
       // Hover readout of the nearest sample.
@@ -196,7 +210,7 @@
         let index = Math.min(times.length - 1, firstIndexAtOrAfter(time));
         if (index > 0 && Math.abs(times[index - 1] - time) < Math.abs(times[index] - time)) index -= 1;
         const x = xOf(times[index]);
-        const y = yOf(values[index]);
+        const value = values[index];
         context.strokeStyle = COLORS.axis;
         context.setLineDash([3, 3]);
         context.beginPath();
@@ -204,11 +218,14 @@
         context.lineTo(x, pad.top + plotHeight);
         context.stroke();
         context.setLineDash([]);
-        context.fillStyle = COLORS.hover;
-        context.beginPath();
-        context.arc(x, y, 3.5, 0, Math.PI * 2);
-        context.fill();
-        const label = clock(times[index]) + "  " + values[index].toFixed(Math.max(yDecimals + 1, 3)) + " " + unit;
+        if (value !== null) {
+          context.fillStyle = COLORS.hover;
+          context.beginPath();
+          context.arc(x, yOf(value), 3.5, 0, Math.PI * 2);
+          context.fill();
+        }
+        const label = clock(times[index]) + "  " +
+          (value === null ? "no reading" : value.toFixed(Math.max(yDecimals + 1, 3)) + " " + unit);
         const labelWidth = context.measureText(label).width + 12;
         const labelX = Math.min(Math.max(x - labelWidth / 2, pad.left), width - pad.right - labelWidth);
         context.fillStyle = "rgba(28, 31, 37, 0.88)";

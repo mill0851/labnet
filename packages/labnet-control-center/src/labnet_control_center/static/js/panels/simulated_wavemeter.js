@@ -127,6 +127,11 @@
 
     // ---- behaviour ----------------------------------------------------------
 
+    function latestText() {
+      const value = chart.latest();
+      return value === null ? "—" : value.toFixed(6) + " nm"; // null: no reading yet, or a bad one
+    }
+
     function updateNote() {
       const ms = Number(exposure.input.value);
       const hz = Number(rate.input.value);
@@ -219,7 +224,7 @@
       const points = chart.points();
       if (points.length === 0) return;
       const rows = ["time_utc,unix_seconds,wavelength_nm"].concat(
-        points.map(([time, value]) => new Date(time * 1000).toISOString() + "," + time.toFixed(6) + "," + value)
+        points.map(([time, value]) => new Date(time * 1000).toISOString() + "," + time.toFixed(6) + "," + (value === null ? "" : value))
       );
       const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "").replace("T", "-");
       const link = el("a", {
@@ -238,7 +243,7 @@
     return {
       snapshot(event) {
         chart.setPoints(event.samples);
-        readout.textContent = event.samples.length ? chart.latest().toFixed(6) + " nm" : "—";
+        readout.textContent = latestText();
         onState(event);
       },
       state: onState,
@@ -248,7 +253,7 @@
       },
       samples(event) {
         chart.addPoints(event.points);
-        readout.textContent = chart.latest().toFixed(6) + " nm";
+        readout.textContent = latestText();
       },
       script: (event) => scriptBox.onScript(event),
     };

@@ -1,5 +1,6 @@
 // Device control page (/<device-id>): a live header, then the control panel
-// for the device's type (static/js/panels/<type>.js, or panels/generic.js).
+// for the device's type: the driver package's own (/api/panels/<type>.js),
+// static/js/panels/<type>.js, or panels/generic.js (see panels.py).
 
 (function () {
   "use strict";
@@ -17,7 +18,7 @@
 
   function mountPanel(device) {
     panelRequested = true;
-    const script = el("script", { src: "/static/js/panels/" + encodeURIComponent(device.panel) + ".js" });
+    const script = el("script", { src: device.panel_url });
     script.onload = () => {
       // Handlers are filled in once the panel exists; events only arrive
       // after this function returns, so none are missed.

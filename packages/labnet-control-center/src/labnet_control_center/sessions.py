@@ -1,11 +1,17 @@
 """Device sessions: the Control Center's lease on one device for its control page.
 
 A session leases the device only while something needs it: the live stream
-(Play) or a running script. Pause and a finished script each give up their
-claim, and the lease is released once neither remains, so the device is free
-for others again. Every browser viewing the page subscribes to the session's
-events (state changes, samples, script output); when the last viewer leaves,
-the session stops after a short grace period.
+(Play), a running script, or the page's own calls (a panel's Move or Apply
+button, see :meth:`DeviceSession.call`). Pause and a finished script each give
+up their claim; calls give theirs up at Pause, after
+:data:`CALL_IDLE_RELEASE_SECONDS` without a call, or at the hold limit. The
+lease is released once no claim remains, so the device is free for others
+again. Every browser viewing the page subscribes to the session's events
+(state changes, samples, script output); when the last viewer leaves, the
+session stops after a short grace period.
+
+Stream samples that are not finite (a reading the device marked bad) reach the
+page as ``None``, a gap in the graph.
 
 Anyone using the Control Center may stop a session, from any computer: the
 Network and Devices pages list what the Control Center holds (see
@@ -30,12 +36,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from labnet.client import AsyncLabClient, ResourceConflictError, ResourceNotFoundError
+from labnet.client.core.exceptions import DeviceOutOfRangeError, InvalidDeviceArgumentError
 from labnet.contracts import DeviceContract, RpcSpec, registry
 
 from .config import ControlCenterSettings
 from .device_calls import SETTING_PATTERNS as _SETTING_PATTERNS
 from .device_calls import STREAM_PATTERN as _STREAM_PATTERN
-from .device_calls import call_device
+from .device_calls import call_device, device_error, json_safe
 from .device_calls import find_method as _method
 from labnet.redaction import redact
 from .script_runner import ScriptProcess
@@ -46,6 +53,11 @@ LOGGER = logging.getLogger(__name__)
 MAX_BUFFERED_SAMPLES = 20_000
 MAX_SAMPLE_RATE_HZ = 200.0
 MAX_SCRIPT_STREAM_SAMPLES = 10_000
+# A page's calls keep the lease this long after the last one (Central's own idle
+# timeout is longer), so a panel left open frees the device for others.
+CALL_IDLE_RELEASE_SECONDS = 300.0
+MAX_CALL_SECONDS = 600.0
+_CALLS = "calls"  # the holder name of the page's calls
 
 
 class SessionError(Exception):
@@ -89,6 +101,10 @@ class DeviceSession:
         self._script: ScriptProcess | None = None
         self._script_devices: dict[str, Any] = {}
         self._script_leased_at: dict[str, float] = {}
+        self._calls_task: asyncio.Task[None] | None = None
+        self._calls_since = 0.0
+        self._last_call_at = 0.0
+        self._calls_running = 0
         self.leased_at: float | None = None
         self.state = "idle"
         self.message: str | None = None
@@ -105,6 +121,8 @@ class DeviceSession:
             "message": self.message,
             "leased": self._device is not None,
             "script_running": self._script is not None,
+            # The page's calls hold the lease (released at Pause, or when idle).
+            "calls_held": _CALLS in self._holders,
             "unit": self.unit,
             "play": self.play_request,
             "started_at": self.started_at,
@@ -253,7 +271,8 @@ class DeviceSession:
                 samples = getattr(self._device, spec.python_name)(**options)
                 try:
                     async for sample in samples:
-                        point = [sample.timestamp_ns / 1e9, sample.value]
+                        # A bad reading is NaN, which JSON cannot carry: it becomes None, a gap.
+                        point = [sample.timestamp_ns / 1e9, json_safe(sample.value)]
                         self._buffer.append(point)
                         self._publish({"type": "samples", "points": [point]})
                 finally:
@@ -283,7 +302,8 @@ class DeviceSession:
             self._stream_task = None
             self._hold_task = None
             await self._release("stream")
-            if had_stream or reason:
+            had_calls = await self._end_calls()
+            if had_stream or had_calls or reason:
                 self._set_state("error" if failed else "idle", reason)
             return self.state_event()
 
@@ -297,6 +317,83 @@ class DeviceSession:
                 break
             await asyncio.sleep(0.1)
         return self.state_event()
+
+    # ---- calls from the page's panel ---------------------------------------------
+
+    async def call(self, method: str, args: dict[str, Any], timeout_seconds: float = 30.0) -> Any:
+        """Run one method for the page's panel and return its result as JSON can carry it.
+
+        The first call leases the device; later ones reuse the lease, which
+        Pause releases (as does :data:`CALL_IDLE_RELEASE_SECONDS` without a call,
+        or the hold limit). Streams are Play's. The Lab PC checks the arguments
+        against the driver's and the site's limits, as for any client.
+        """
+
+        self._refuse_if_granted(self.device_id)
+        contract = await self._ensure_contract()
+        spec = _method(contract, method)
+        if spec is None:
+            raise SessionError(400, f"{method!r} is not a method of {contract.device_type}.")
+        if spec.pattern == _STREAM_PATTERN:
+            raise SessionError(400, f"{method} is a stream: use Play.")
+        if not 0 < timeout_seconds <= MAX_CALL_SECONDS:
+            raise SessionError(400, f"timeout_seconds must be above 0 and at most {MAX_CALL_SECONDS:g}.")
+        async with self._lock:
+            first = _CALLS not in self._holders
+            await self._acquire(_CALLS)
+            device = self._device
+            self._calls_running += 1
+            self._last_call_at = time.time()
+            if first:
+                self._calls_since = self._last_call_at
+                self._calls_task = asyncio.create_task(self._calls_limit())
+                if not self._subscribers and self._idle_task is None:
+                    self._idle_task = asyncio.create_task(self._release_when_unwatched())
+                self._publish(self.state_event())
+        try:
+            result = await call_device(device, spec, {**args, "timeout_seconds": timeout_seconds})
+        except (TypeError, ValueError, InvalidDeviceArgumentError, DeviceOutOfRangeError) as exc:
+            raise SessionError(400, f"{method}: {device_error(exc)}") from exc
+        except Exception as exc:  # the device failed, the Lab PC is gone, the lease was lost...
+            LOGGER.warning("%s.%s failed: %s", self.device_id, method, exc)
+            raise SessionError(502, f"{method} failed: {device_error(exc)}") from exc
+        finally:
+            self._calls_running -= 1
+            self._last_call_at = time.time()
+        return json_safe(result)
+
+    async def _calls_limit(self) -> None:
+        """Release the calls' lease when they go idle or reach the hold limit."""
+
+        hold_seconds = self._settings.max_hold_minutes * 60
+        while True:
+            now = time.time()
+            hold_end = self._calls_since + hold_seconds
+            idle_end = self._last_call_at + CALL_IDLE_RELEASE_SECONDS
+            if now >= hold_end:
+                reason = f"Released automatically after {self._settings.max_hold_minutes:g} minutes."
+                break
+            if now >= idle_end and not self._calls_running:
+                reason = f"Released: no commands for {CALL_IDLE_RELEASE_SECONDS / 60:g} minutes."
+                break
+            await asyncio.sleep(max(0.05, min(hold_end, idle_end) - now))
+        asyncio.create_task(self._release_calls(reason))
+
+    async def _release_calls(self, reason: str) -> None:
+        async with self._lock:
+            if await self._end_calls():
+                self._set_state(self.state, reason)
+
+    async def _end_calls(self) -> bool:
+        """Drop the calls' claim on the lease (the caller holds the lock); False if there was none."""
+
+        task, self._calls_task = self._calls_task, None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        if _CALLS not in self._holders:
+            return False
+        await self._release(_CALLS)
+        return True
 
     def activity(self) -> dict[str, dict[str, Any]]:
         """What this session holds right now, by device id (empty when idle)."""
