@@ -33,7 +33,7 @@ makes (in `dist/`, git-ignored):
 ```text
 dist/labnet-x.y.z-pqt/
   MANIFEST.json      version, site, git revision, which wheel each role installs, SHA-256 of every file
-  wheels/*.whl       LabNet, the Control Center, the drivers, and every dependency (for Windows, Python 3.11)
+  wheels/*.whl       LabNet, the Control Center, the drivers, and every dependency (for Windows and the bundle's Python)
   site-pqt.zip       sites/pqt/: env templates, the Caddyfile template, every Lab PC inventory
 ```
 
@@ -59,10 +59,10 @@ powershell -ExecutionPolicy Bypass -File $install -Role client           # on ea
 
 `install.ps1` checks the bundle, installs `labnet` from it into a temporary
 environment, and runs `labnet update` from there, so the update never runs
-from the environment it replaces. It needs only Python 3.11 and its `py`
-launcher (`-Python <python.exe>` picks another). `-ExecutionPolicy Bypass`
-applies to that one run: Windows otherwise refuses unsigned scripts from a
-share. Where `labnet` is already installed, `labnet update --from <bundle>
+from the environment it replaces. It needs only the bundle's Python version
+(`labnet bundle --python`, 3.11 by default) and its `py` launcher
+(`-Python <python.exe>` picks another). `-ExecutionPolicy Bypass` applies to
+that one run: Windows otherwise refuses unsigned scripts from a share. Where `labnet` is already installed, `labnet update --from <bundle>
 --role <role>` does the same.
 
 `labnet update` handles the steps that are easy to get wrong:

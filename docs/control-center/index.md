@@ -13,6 +13,8 @@ Central for the network picture, so no API key ever reaches a browser.
 | `/api/status` | The same picture as JSON; refreshed from Central at most every `LABNET_CONTROL_CENTER_REFRESH_SECONDS` |
 | `/api/devices/<id>/events` | Live events for a device page: state, samples, script output |
 | `/api/devices/<id>/play`, `/pause`, `/script`, `/script/stop` | Device page controls |
+| `/api/devices/<id>/call` | One method for a panel's button, with the page's lease (see [Device control pages](#device-control-pages)) |
+| `/api/panels/<device_type>.js` | The panel a driver package ships for its device type (see [Panels from driver packages](#panels-from-driver-packages)) |
 | `/experiments` | **Experiments** tab: every saved experiment, with its devices' live state |
 | `/experiments/<id>` | The experiment's canvas: setup diagram, settings, Export script (see below) |
 | `/api/experiments`, `/api/experiments/<id>`, `/validate`, `/meta`, `/<id>/script` | List, create, read, save (with the version it is based on), delete, check, describe the components, export |
