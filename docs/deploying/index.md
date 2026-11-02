@@ -34,8 +34,36 @@ are static and all connections use raw IP addresses; no DNS service is assumed.
 
 Exclude each address from DHCP, or reserve it for that computer. The
 certificates contain the server IPs, so changing a server's IP requires a new
-certificate. Each runtime computer needs Python 3.11 (`py -3.11` in
-PowerShell).
+certificate. Each runtime computer needs the lab's Python version: the one
+the bundle is built for (`labnet bundle --python`, 3.11 unless you choose
+another), with its `py` launcher (`py -3.11` in PowerShell).
+
+A small lab can run several of these roles on one computer, e.g. Central, the
+Control Center and a Lab PC; see
+[Several roles on one computer](#several-roles-on-one-computer).
+
+### First deployment at a glance
+
+The steps below, and the pages they link to, in order:
+
+1. **Certificates and the bundle** on the development PC
+   ([1. Prepare `development_pc`](#1-prepare-development_pc)): a private CA, one
+   server certificate per server IP, and `labnet bundle` with every
+   [driver package](#driver-packages-in-the-bundle) the lab uses.
+2. **Central** ([2. Set up `central_server_pc`](#2-set-up-central_server_pc)):
+   `central.env`, install, the users and their settings files, then Caddy for HTTPS.
+3. **The Control Center** on the same computer
+   ([Setting up the Control Center](../control-center/index.md#setting-up-the-control-center-in-the-lab)):
+   its Central user, install, its Caddy site and [logins](../control-center/logins.md#logins),
+   and the CA in each viewing computer's certificate store.
+4. **The safe-state watchdog**, only if Automation is on
+   (`LABNET_AUTOMATION_ENABLED`). A first deployment can leave Automation and
+   Photo-Agent off and add them later.
+5. **Each Lab PC** ([3. Set up each Lab PC](#3-set-up-each-lab-pc)): vendor
+   drivers, its certificate, `lab-pc.env`, install, start.
+6. **Clients** ([4. Set up a client](#4-set-up-a-client)).
+7. **Check** the whole lab with the
+   [deployment verification](#deployment-verification) list.
 
 ### 1. Prepare `development_pc`
 
@@ -126,10 +154,33 @@ A wheel is an installable package archive. It does **not** contain settings,
 keys, certificates, or databases; `labnet bundle` refuses a site folder that
 holds any.
 
+#### Driver packages in the bundle
+
+Pass `--driver <folder>` once for each driver package the lab's inventories
+use, and for each local package they depend on that isn't on PyPI (e.g. a
+lab's own instrument library). `labnet bundle` builds a wheel from every such
+folder and downloads the rest of their dependencies.
+
+```bash
+labnet bundle --site sites/<lab> --python 3.13 \
+    --driver drivers/<lab>_drivers --driver ../<lab>_instruments --driver packages/labnet-sim
+```
+
+- With no `--driver`, the bundle holds `packages/labnet-sim` only. Once you
+  name your own drivers, list `packages/labnet-sim` too if you still want
+  the simulated instruments.
+- `--python` must satisfy every driver's `requires-python`; it is also the
+  Python each computer needs.
+- The drivers are installed for the Lab PC, Control Center and client roles,
+  not for Central. The Control Center needs them for each device's contract
+  and for any [panel a driver ships](../control-center/index.md#panels-from-driver-packages);
+  clients need them for the device classes.
+
 #### Installing from the bundle
 
 Every computer installs its role with the bundle's `install.ps1`, which
-needs only Python 3.11 and its `py` launcher:
+needs only the bundle's Python version (from its `MANIFEST.json`) and its
+`py` launcher:
 
 ```powershell
 $install = '\\192.168.50.40\LabNet-Releases\x.y.z\install.ps1'
@@ -313,11 +364,42 @@ banner until Central answers. Before an update, stop the affected windows;
 ### Network rules summary
 
 - Central: allow TCP 443 from approved Lab PCs and client networks.
+- Control Center: allow TCP 8443 from the viewing computers, if it has its own
+  port on Central's IP (see [its address](../control-center/index.md#setting-up-the-control-center-in-the-lab)).
 - Lab PC: allow TCP 50051 from approved client networks.
-- Never expose Central's port 8008 or a Lab PC's port 9001.
+- Never expose Central's port 8008, the Control Center's 8080 or a Lab PC's 9001.
 - Clients need no inbound rule.
 - Where practical, limit outbound traffic: Lab PCs need Central HTTPS; clients
   need Central HTTPS and the gRPC ports of authorized Lab PCs.
+
+### Several roles on one computer
+
+A small lab can run Central, Caddy, the Control Center and a Lab PC on one
+computer (its instruments plugged into it). Nothing in the setup changes
+except the following.
+
+- **Ports don't clash.** Facing the network: 443 (Central through Caddy),
+  8443 (the Control Center through Caddy) and 50051 (the Lab PC's gRPC). On
+  loopback only: 8008 (Central), 8080 (the Control Center), 9001 (the Lab
+  PC's health). Open the first three in the firewall, as above.
+- **One certificate.** A server certificate names the IP clients dial, and
+  every server here has the same IP. Issue one
+  (`labnet-certs issue <pc> --ip <its IP> --dir C:\LabNet-CA`) and use it for
+  Caddy's sites (`tls` lines) and for the Lab PC (`LABNET_GRPC_CERT_FILE`,
+  `LABNET_GRPC_KEY_FILE`). Keep the key readable only by Administrators and
+  the account that runs them.
+- **The Lab PC reaches Central on loopback.** Like the Control Center, it may
+  use `LABNET_SERVER_URL=http://127.0.0.1:8008`; plain HTTP is accepted only
+  on loopback. `https://<its IP>` through Caddy works too, but then the Lab PC
+  depends on Caddy running.
+- **Each role has its own environment.** Run `install.ps1` once per role, in
+  the order Central, Control Center, Lab PC. They install side by side
+  (`central-venv`, `control-center-venv`, `lab-pc-venv`).
+- **Start order** is the table in [Starting the lab by hand](#starting-the-lab-by-hand),
+  all on this computer: Central, Caddy, the Control Center (and the watchdog,
+  with Automation on), then the Lab PC. That is four or five windows.
+- **Vendor software** the drivers need (an instrument's own application or
+  server) must be running before the Lab PC starts, as on any Lab PC.
 
 ### Deployment verification
 
@@ -332,3 +414,7 @@ Verify in this order:
 5. The client leases a device and completes one harmless read.
 6. A second client cannot lease the same device at the same time.
 7. Closing the first client releases the lease and frees the device.
+8. From a viewing computer, the Control Center's **Network** page lists each
+   Lab PC online with its devices, and each device's page (`/<device-id>`)
+   opens with its own panel, not the generic script box, when its driver
+   ships one.
