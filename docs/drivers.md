@@ -84,6 +84,9 @@ publishes no numeric limits (so its Lab PC must set site limits).
 
 Deploy Lab PCs that serve a new RPC before clients that call it.
 
+A driver package can also ship the Control Center's control page for its
+device types: see [Panels from driver packages](control-center/index.md#panels-from-driver-packages).
+
 ## Another instrument of an existing family
 
 No code generation is needed:

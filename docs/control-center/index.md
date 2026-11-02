@@ -30,10 +30,10 @@ In development `labnet dev up` starts it at `http://127.0.0.1:8080/status`.
 
 ## Device control pages
 
-Each device page loads the control panel for its device type:
-`static/js/panels/<device_type>.js`, or `panels/generic.js` (a script box
-only) when a type has none yet. The simulated wavemeter's panel has three
-parts:
+Each device page loads the control panel for its device type: the one its
+driver package ships (see [Panels from driver packages](#panels-from-driver-packages)),
+else `static/js/panels/<device_type>.js`, else `panels/generic.js` (a script
+box only). The simulated wavemeter's panel has three parts:
 
 1. **Live graph.**
    - **Play** leases the device, sends the parameters (exposure first), then
@@ -48,6 +48,9 @@ parts:
 3. **Script box.** Python-style commands that run on the Control Center
    with the page's lease (see below).
 
+A bad reading in a stream (one the Lab PC marks BAD because it is not a
+number, e.g. a wavemeter with no light) is a gap in the graph, not an error.
+
 The Control Center holds the lease, not the browser. Everyone viewing a
 device page shares one session, so anyone viewing it sees the same graph.
 The session releases the device:
@@ -55,6 +58,23 @@ The session releases the device:
 - 15 s after the last viewer closes the page;
 - after the maximum hold time (30 min); or
 - if the device or lease fails.
+
+A panel's buttons (a move, a setting, one spectrum) call one method each,
+through `POST /api/devices/<id>/call`:
+
+```json
+{"method": "move_to_wavelength_nm", "args": {"wavelength_nm": 770.0}, "timeout_seconds": 60}
+```
+
+The reply is `{"value": <result>}`: a number, text, or a list for a command
+that returns one; not-a-number becomes `null`. A call:
+- shares the page's lease, and takes it if the page has none. The lease
+  stays until Pause, 5 minutes without a call, or the maximum hold time.
+- waits up to `timeout_seconds` (default 30, at most 600) for the device.
+- is checked by the Lab PC like any client's: the driver's and the site's
+  limits apply, and a refused value is a 400 with the Lab PC's message.
+- is refused (409) while an Automation grant holds the device, like Play.
+- can't open a stream: use Play.
 
 If someone else already holds the device, Play reports that it is in use.
 
@@ -90,12 +110,39 @@ the full text. Stream methods
 inside a script need a `sample_count` (at most 10 000) and return a list of
 values.
 
-To add a panel for another device type, copy
+To add a panel for one of LabNet's own device types, copy
 `static/js/panels/simulated_wavemeter.js` to `static/js/panels/<device_type>.js`
-and register it as `LabNet.panels["<device_type>"]`. The shared pieces are
-`createChart`, `createScriptBox`, and the session (`session.play`,
-`session.pause`, `session.runScript`). The page picks the new panel up
-automatically.
+and register it as `LabNet.panels["<device_type>"]`. The shared pieces are:
+- `createChart`: a live time series;
+- `createPlot`: an x-y plot that zooms (drag, scroll, double-click to reset),
+  for a spectrum or a scan;
+- `createScriptBox`;
+- the session: `session.play`, `session.pause`, `session.call`,
+  `session.runScript`.
+
+The page picks the new panel up automatically.
+
+### Panels from driver packages
+
+A driver package can ship the panel for its own device types, so a lab's page
+lives with the lab's driver and not in LabNet. Put `<device_type>.js` in a
+package directory and register that package in the entry-point group
+`labnet.control_center.panels`, one entry per device type:
+
+```toml
+[project.entry-points."labnet.control_center.panels"]
+acme_laser = "acme_drivers.panels"
+
+[tool.setuptools.package-data]
+acme_drivers = ["panels/*.js"]
+```
+
+The file is written like a built-in panel: it registers
+`LabNet.panels["acme_laser"]`. The Control Center serves it at
+`/api/panels/acme_laser.js`, and it wins over a built-in panel for the same
+type. Install the driver package on the Control Center's computer, as for its
+contract. The panel runs with the signed-in person's session, so install only
+driver packages you trust.
 
 ## Experiments
 

@@ -15,6 +15,20 @@ together with the same version.
   comes back to clients as a tuple of floats (`CommandResult.floating_point_sequence`).
   Non-finite values are refused. Lab PCs must be updated before clients that
   rely on it.
+- Control Center: a panel can **call one method** (`POST /api/devices/<id>/call`,
+  `session.call(...)` in a panel), e.g. a Move or Apply button. It shares the
+  page's lease, which it keeps until Pause, 5 minutes without a call, or the
+  maximum hold time. The Lab PC checks the arguments as for any client.
+- Control Center: **driver packages can ship the control panel** for their device
+  types (entry-point group `labnet.control_center.panels`), served at
+  `/api/panels/<device_type>.js`. Device entries in `/api/status` gain `panel_url`.
+- Control Center: `createPlot`, an x-y plot that zooms, for spectra and scans.
+
+### Fixed
+
+- Control Center: a bad stream reading (NaN) broke the device page's live
+  feed, because NaN is not JSON. It now reaches the page as `null`, a gap in
+  the graph.
 
 ## [3.0.0] - 2026-10-09
 

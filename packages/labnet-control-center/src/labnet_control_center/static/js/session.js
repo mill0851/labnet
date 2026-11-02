@@ -5,6 +5,10 @@
 //     snapshot(event), state(event), reset(), samples(event), script(event), connection(ok)
 //   });
 //   await session.play({ settings: [...], stream: {...} });
+//   const value = await session.call("move_to_wavelength_nm", { wavelength_nm: 770 }, { timeout_seconds: 60 });
+//
+// A call shares the page's lease (taking it if needed) until Pause; its
+// errors are thrown with the Control Center's message.
 
 (function () {
   "use strict";
@@ -44,6 +48,11 @@
     return {
       play: (request) => post("/play", request),
       pause: () => post("/pause"),
+      call: async (method, args, options) => {
+        const timeout = options && options.timeout_seconds;
+        const data = await post("/call", { method, args: args || {}, timeout_seconds: timeout });
+        return data.value;
+      },
       runScript: (code) => post("/script", { code }),
       stopScript: () => post("/script/stop"),
       close: () => events.close(),

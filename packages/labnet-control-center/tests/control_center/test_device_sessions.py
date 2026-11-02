@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import math
 import socket
 import threading
 import time
 
+import grpc
 import httpx
 import pytest
 import uvicorn
@@ -15,7 +18,9 @@ from fastapi.testclient import TestClient
 
 from labnet.client import LabPCInfo, ResourceConflictError
 from labnet.client.core.models import DeviceInfo, EndpointDescriptor, Measurement, MeasurementQuality
-from labnet_control_center.app import create_app
+from labnet.client.core.exceptions import InvalidDeviceArgumentError
+from labnet_control_center import panels, sessions
+from labnet_control_center.app import _sse, create_app
 from labnet_control_center.config import ControlCenterSettings
 from labnet_control_center.sessions import DeviceSession, SessionError
 from labnet_sim._generated.contracts import SIMULATED_WAVEMETER_CONTRACT
@@ -42,10 +47,11 @@ def _settings(**overrides) -> ControlCenterSettings:
 
 
 class FakeStream:
-    def __init__(self, log: list[str], rate: float) -> None:
+    def __init__(self, log: list[str], rate: float, bad_readings: bool = False) -> None:
         self._log = log
         self._interval = 1 / rate
         self._sequence = 0
+        self._bad_readings = bad_readings  # every other reading NaN, as a Lab PC sends a BAD one
 
     def __aiter__(self):
         return self
@@ -53,6 +59,11 @@ class FakeStream:
     async def __anext__(self) -> Measurement:
         await asyncio.sleep(self._interval)
         self._sequence += 1
+        if self._bad_readings and self._sequence % 2 == 0:
+            return Measurement(
+                operation_id="op", sequence=self._sequence, timestamp_ns=time.time_ns(),
+                value=math.nan, unit="nm", quality=MeasurementQuality.BAD, status="NON_FINITE",
+            )
         return Measurement(
             operation_id="op", sequence=self._sequence, timestamp_ns=time.time_ns(),
             value=780.241 + self._sequence * 1e-6, unit="nm",
@@ -65,17 +76,27 @@ class FakeStream:
 
 class FakeWavemeter:
     contract = SIMULATED_WAVEMETER_CONTRACT
+    bad_readings = False
+    read_error: Exception | None = None
 
     def __init__(self, log: list[str]) -> None:
         self._log = log
 
-    async def set_exposure(self, value: float) -> Measurement:
-        self._log.append(f"set_exposure {value:g}")
+    async def set_exposure(self, value: float, *, timeout_seconds: float | None = None) -> Measurement:
+        self._log.append(f"set_exposure {value:g}" + (f" within {timeout_seconds:g} s" if timeout_seconds else ""))
         return value
+
+    async def read_wavelength(self, *, timeout_seconds: float | None = None) -> Measurement:
+        if self.read_error is not None:
+            raise self.read_error
+        return Measurement(
+            operation_id="op", sequence=1, timestamp_ns=time.time_ns(), value=780.241, unit="nm",
+            quality=MeasurementQuality.GOOD, status="OK",
+        )
 
     def stream_wavelength(self, *, sample_rate_hz: float, **_ignored) -> FakeStream:
         self._log.append("stream opened")
-        return FakeStream(self._log, sample_rate_hz)
+        return FakeStream(self._log, sample_rate_hz, self.bad_readings)
 
     async def aclose(self) -> None:
         self._log.append("lease released")
@@ -340,3 +361,187 @@ def test_the_device_list_shows_and_pauses_what_the_control_center_holds() -> Non
         assert released.status_code == 200 and released.json()["leased"] is False
         meter = devices()["dev02-wavemeter"]
         assert meter["state"] == "available" and meter["control_center"] is None
+
+
+# ---- calls from a page's panel ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_calls_share_one_lease_until_pause() -> None:
+    central = FakeCentral()
+    session = _session(central)
+    viewer = session.subscribe()
+
+    assert await session.call("set_exposure", {"value": 20}, timeout_seconds=45) == 20
+    assert await session.call("read_wavelength", {}) == 780.241
+    assert session.state_event()["calls_held"] is True
+    state = await session.pause()
+
+    assert central.log == ["lease acquired", "set_exposure 20 within 45 s", "lease released"]
+    assert state["leased"] is False and state["calls_held"] is False
+    events = [viewer.queue.get_nowait() for _ in range(viewer.queue.qsize())]
+    assert [event["calls_held"] for event in events if event["type"] == "state"] == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_calls_and_the_stream_share_one_lease() -> None:
+    central = FakeCentral()
+    session = _session(central)
+    session.subscribe()
+    await session.play(PLAY)
+    await session.call("set_exposure", {"value": 30})
+    await session.pause()
+
+    assert central.log.count("lease acquired") == central.log.count("lease released") == 1
+
+
+@pytest.mark.asyncio
+async def test_bad_calls_are_refused_before_leasing() -> None:
+    central = FakeCentral()
+    session = _session(central)
+    for method, timeout, message in [
+        ("no_such_method", 30, "not a method"),
+        ("stream_wavelength", 30, "use Play"),
+        ("read_wavelength", 0, "timeout_seconds"),
+        ("read_wavelength", 10_000, "timeout_seconds"),
+    ]:
+        with pytest.raises(SessionError, match=message) as failure:
+            await session.call(method, {}, timeout_seconds=timeout)
+        assert failure.value.status_code == 400
+    assert central.log == []
+
+
+@pytest.mark.asyncio
+async def test_calls_are_refused_on_a_device_automation_holds() -> None:
+    central = FakeCentral()
+    session = DeviceSession("dev02-wavemeter", central, _settings(), blocked=lambda _device_id: True)
+
+    with pytest.raises(SessionError, match="Automation") as failure:
+        await session.call("read_wavelength", {})
+
+    assert failure.value.status_code == 409 and central.log == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_argument_and_a_failed_call_are_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _session(FakeCentral())
+
+    with pytest.raises(SessionError, match="unexpected keyword") as wrong_name:
+        await session.call("set_exposure", {"exposure": 20})
+    monkeypatch.setattr(
+        FakeWavemeter, "read_error",
+        InvalidDeviceArgumentError(grpc.StatusCode.INVALID_ARGUMENT, "value must be within [757, 782]."),
+    )
+    with pytest.raises(SessionError, match=r"within \[757, 782\]") as out_of_range:
+        await session.call("read_wavelength", {})
+    monkeypatch.setattr(FakeWavemeter, "read_error", RuntimeError("the Lab PC went away"))
+    with pytest.raises(SessionError, match="went away") as failed:
+        await session.call("read_wavelength", {})
+    await session.pause()
+
+    assert wrong_name.value.status_code == 400
+    assert out_of_range.value.status_code == 400
+    assert failed.value.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_calls_give_the_lease_back_when_they_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sessions, "CALL_IDLE_RELEASE_SECONDS", 0.2)
+    central = FakeCentral()
+    session = _session(central, idle_release_seconds=60)
+    session.subscribe()
+
+    await session.call("read_wavelength", {})
+    await _until(lambda: "lease released" in central.log, seconds=3)
+
+    state = session.state_event()
+    assert state["calls_held"] is False and "no commands" in state["message"]
+
+
+@pytest.mark.asyncio
+async def test_calls_give_the_lease_back_at_the_hold_limit() -> None:
+    central = FakeCentral()
+    session = _session(central, max_hold_minutes=0.005, idle_release_seconds=60)  # 0.3 s
+    session.subscribe()
+
+    for _ in range(3):  # busy, so only the hold limit can end it
+        await session.call("read_wavelength", {})
+        await asyncio.sleep(0.05)
+    await _until(lambda: "lease released" in central.log, seconds=3)
+
+    assert "automatically" in session.state_event()["message"]
+
+
+def test_the_call_endpoint_returns_the_value_and_checks_the_request() -> None:
+    central = FakeCentral()
+    app = create_app(_settings(idle_release_seconds=60), client_factory=lambda _: central)
+    with TestClient(app) as browser:
+        base = "/api/devices/dev02-wavemeter"
+        reply = browser.post(f"{base}/call", json={"method": "read_wavelength"})
+        assert reply.status_code == 200 and reply.json() == {"value": 780.241}
+
+        refused = [
+            {"method": "set_exposure", "args": {"value": [1, 2]}},
+            {"method": "read_wavelength", "timeout_seconds": 5000},
+        ]
+        for body in refused:
+            assert browser.post(f"{base}/call", json=body).status_code == 422
+        stream = browser.post(f"{base}/call", json={"method": "stream_wavelength"})
+        assert stream.status_code == 400 and "use Play" in stream.json()["detail"]
+
+        assert browser.post(f"{base}/pause").json()["leased"] is False
+    assert central.log == ["lease acquired", "lease released"]
+
+
+@pytest.mark.asyncio
+async def test_bad_stream_readings_reach_the_page_as_gaps(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(FakeWavemeter, "bad_readings", True)
+    session = _session(FakeCentral())
+    viewer = session.subscribe()
+    await session.play(PLAY)
+    await asyncio.sleep(0.2)
+    await session.pause()
+
+    values = [point[1] for point in session.snapshot_event()["samples"]]
+    assert None in values and any(isinstance(value, float) for value in values)
+
+    def refuse(constant: str) -> None:
+        raise AssertionError(f"{constant} is not JSON")
+
+    events = [viewer.queue.get_nowait() for _ in range(viewer.queue.qsize())]
+    for event in [session.snapshot_event(), *events]:
+        json.loads(_sse(event).removeprefix("data: "), parse_constant=refuse)
+
+
+# ---- panels that driver packages ship --------------------------------------------
+
+
+def test_a_driver_package_panel_is_served_and_chosen(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    package = tmp_path / "acme_panels"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "simulated_wavemeter.js").write_text("// the driver's panel\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(panels, "_registered", lambda: {"simulated_wavemeter": "acme_panels"})
+
+    app = create_app(_settings(), client_factory=lambda _: FakeCentral())
+    with TestClient(app) as browser:
+        device = browser.get("/api/status").json()["lab_pcs"][0]["devices"][0]
+        script = browser.get(device["panel_url"])
+        missing = browser.get("/api/panels/dummy_aom.js")
+
+    assert device["panel"] == "simulated_wavemeter"
+    assert device["panel_url"] == "/api/panels/simulated_wavemeter.js"
+    assert script.status_code == 200 and script.text == "// the driver's panel\n"
+    assert script.headers["content-type"].startswith("text/javascript")
+    assert missing.status_code == 404
+
+
+def test_without_a_driver_panel_the_built_in_one_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(panels, "_registered", lambda: {})
+
+    assert panels.panel_for("simulated_wavemeter") == (
+        "simulated_wavemeter", "/static/js/panels/simulated_wavemeter.js"
+    )
+    assert panels.panel_for("acme_laser") == ("generic", "/static/js/panels/generic.js")
+    assert panels.driver_panel("simulated_wavemeter") is None
